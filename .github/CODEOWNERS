@@ -1,0 +1,7 @@
+# Anything under .github/ or any Terraform change needs review.
+# Combined with a branch protection rule requiring CODEOWNERS approval,
+# this is what stops someone merging their own infrastructure change.
+
+*.tf            @rohanbaba9492
+.github/        @rohanbaba9492
+oidc-bootstrap/ @rohanbaba9492

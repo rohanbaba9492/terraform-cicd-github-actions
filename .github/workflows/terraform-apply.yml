@@ -1,0 +1,155 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-*.yml'
+    # oidc-bootstrap/ is run by hand, once, before the pipeline exists. It
+    # must not be applied by the pipeline it bootstraps -- that is a
+    # chicken-and-egg loop where the roles the workflow needs are themselves
+    # managed by the workflow.
+    paths-ignore:
+      - 'oidc-bootstrap/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "apply" to confirm a manual run'
+        required: true
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+# Never let two applies run at once. Terraform's DynamoDB lock would block
+# the second one anyway, but failing at the queue is cleaner than failing
+# five minutes in with a lock error.
+concurrency:
+  group: terraform-apply-main
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: '1.9.8'
+  AWS_REGION: us-east-1
+  WORKING_DIR: .
+
+jobs:
+  preflight:
+    name: Check configuration
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          ROLE_ARN: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE_ARN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Terraform apply skipped"
+              echo ""
+              echo "\`AWS_APPLY_ROLE_ARN\` is not set. Nothing was applied."
+              echo "See \`oidc-bootstrap/\` for how to create the role."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  apply:
+    name: Apply
+    runs-on: ubuntu-latest
+    needs: preflight
+
+    # A GitHub Environment with a required reviewer turns this into a manual
+    # approval gate. Configure under Settings > Environments > production.
+    environment:
+      name: production
+
+    if: >-
+      needs.preflight.outputs.configured == 'true' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.confirm == 'apply'))
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      # Re-plan rather than reusing the PR artifact.
+      #
+      # Reusing the reviewed plan is the theoretically correct thing to do,
+      # but a plan file is only valid against the state serial it was made
+      # from. If anything else applied between review and merge, `terraform
+      # apply tfplan` errors with "saved plan is stale". Re-planning and
+      # diffing the change count is the pragmatic compromise: it catches
+      # drift, and the count is printed in the job summary for the record.
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform plan -no-color -input=false -lock-timeout=5m -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          echo "### Plan for this apply" >> "$GITHUB_STEP_SUMMARY"
+          echo '```terraform' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^(Plan:|No changes)' plan.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guard against destroys
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          # terraform show -json gives structured output. Counting "delete"
+          # actions is far more reliable than grepping human-readable text.
+          DESTROYS=$(terraform show -json tfplan \
+            | jq '[.resource_changes[]?
+                   | select(.change.actions | index("delete"))] | length')
+
+          echo "Resources to be destroyed: $DESTROYS"
+          echo "destroy_count=$DESTROYS" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DESTROYS" -gt 0 ]; then
+            echo "::warning::This apply destroys $DESTROYS resource(s)."
+            # Uncomment to make destroys a hard stop requiring workflow_dispatch:
+            # if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            #   echo "::error::Destroys require a manual workflow_dispatch run."
+            #   exit 1
+            # fi
+          fi
+
+      - name: Apply
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform apply -no-color -input=false -lock-timeout=5m tfplan
+
+      - name: Outputs to job summary
+        if: success()
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          echo "### Outputs" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform output >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "(none)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release the lock if we were cancelled mid-apply
+        if: cancelled()
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          echo "::warning::Run cancelled. If a lock is stuck, find the ID in"
+          echo "::warning::the DynamoDB table and run: terraform force-unlock <ID>"

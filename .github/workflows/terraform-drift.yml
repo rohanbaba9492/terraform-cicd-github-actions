@@ -1,0 +1,113 @@
+name: Drift Detection
+
+# Runs on a schedule and tells you when reality no longer matches the code --
+# someone clicked something in the console, or a resource changed out from
+# under you. An empty plan on a nightly run is the only proof that your code
+# is actually the source of truth.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'   # 07:00 UTC, weekdays
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  TF_VERSION: '1.9.8'
+  AWS_REGION: us-east-1
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE_ARN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  drift:
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-drift-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      - name: Detect drift
+        id: drift
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -input=false -lock-timeout=5m -out=tfplan
+          CODE=$?
+          set -e
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+          echo "exitcode=$CODE" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > plan.txt 2>/dev/null || true
+          if [ "$CODE" -eq 1 ]; then exit 1; fi
+
+      - name: Open an issue if drifted
+        if: steps.drift.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8').slice(-50000);
+            const title = `Infrastructure drift detected — ${new Date().toISOString().slice(0,10)}`;
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift',
+            });
+
+            const body = `A scheduled plan found changes. Either the console was used directly, or something outside Terraform changed a resource.
+
+            <details><summary>Plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+
+            </details>`;
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['drift'],
+              });
+            }

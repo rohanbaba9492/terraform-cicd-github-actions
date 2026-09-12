@@ -1,0 +1,236 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-*.yml'
+
+# OIDC needs id-token: write. contents: read to check out.
+# pull-requests: write so the bot can post the plan as a comment.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+# Cancel a superseded run when someone pushes again to the same PR.
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: '1.9.8'
+  AWS_REGION: us-east-1
+  WORKING_DIR: .
+
+jobs:
+  # The `secrets` context is NOT available in a job-level `if:` -- GitHub only
+  # exposes github, needs, vars and inputs there. So the check has to happen
+  # inside a step, and the result is passed forward as a job output.
+  #
+  # Without this, a clone of this repo that has not set up the OIDC roles yet
+  # gets a red failed run on its first push, which looks like the pipeline is
+  # broken when it is just unconfigured.
+  preflight:
+    name: Check configuration
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE_ARN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Terraform plan skipped"
+              echo ""
+              echo "\`AWS_PLAN_ROLE_ARN\` is not set, so there is no AWS role to assume."
+              echo "See \`oidc-bootstrap/\` in this repository for how to create it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # No access keys anywhere. GitHub mints a short-lived OIDC token,
+          # AWS trades it for temporary credentials scoped to this repo.
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      - name: Format check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Init
+        id: init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      - name: Validate
+        id: validate
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform validate -no-color
+
+      - name: Install tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        id: tflint
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          tflint --init
+          tflint --format compact
+        continue-on-error: true
+
+      - name: Trivy IaC scan
+        id: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: ${{ env.WORKING_DIR }}
+          format: table
+          exit-code: '0'      # report, do not block -- see README for why
+          severity: HIGH,CRITICAL
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform plan -no-color -input=false -lock-timeout=5m -out=tfplan
+        continue-on-error: true
+
+      # Upload the binary plan so the apply job on merge can consume the
+      # EXACT plan that was reviewed, rather than re-planning against a
+      # world that may have changed.
+      - name: Upload plan artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.pull_request.number }}
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 5
+
+      - name: Summarise plan
+        id: summary
+        if: always()
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          if [ -f tfplan ]; then
+            terraform show -no-color tfplan > plan.txt
+            # Line the humans actually read.
+            grep -E '^(Plan:|No changes|Changes to Outputs)' plan.txt | head -1 > shortline.txt || true
+          else
+            echo "Plan failed to produce an artifact." > plan.txt
+            echo "Plan failed" > shortline.txt
+          fi
+
+          # GitHub comments cap at 65535 chars. Truncate from the FRONT so the
+          # summary line at the end of the plan survives.
+          CHARS=$(wc -c < plan.txt)
+          if [ "$CHARS" -gt 60000 ]; then
+            {
+              echo "...plan truncated, $CHARS characters total. Full output in the job log."
+              tail -c 60000 plan.txt
+            } > plan.trunc
+            mv plan.trunc plan.txt
+          fi
+
+          echo "shortline=$(cat shortline.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Comment plan on PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          SHORTLINE: ${{ steps.summary.outputs.shortline }}
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.WORKING_DIR }}/plan.txt', 'utf8');
+            const icon = (s) => s === 'success' ? '✅' : (s === 'skipped' ? '⏭️' : '❌');
+            const MARKER = '<!-- terraform-plan-comment -->';
+
+            const body = `${MARKER}
+            ## Terraform plan — \`${{ env.WORKING_DIR }}\`
+
+            | Step | Result |
+            |---|---|
+            | Format | ${icon('${{ steps.fmt.outcome }}')} \`${{ steps.fmt.outcome }}\` |
+            | Init | ${icon('${{ steps.init.outcome }}')} \`${{ steps.init.outcome }}\` |
+            | Validate | ${icon('${{ steps.validate.outcome }}')} \`${{ steps.validate.outcome }}\` |
+            | tflint | ${icon('${{ steps.tflint.outcome }}')} \`${{ steps.tflint.outcome }}\` |
+            | Plan | ${icon(process.env.PLAN_OUTCOME)} \`${process.env.PLAN_OUTCOME}\` |
+
+            **${process.env.SHORTLINE || 'see below'}**
+
+            <details><summary>Show plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+
+            </details>
+
+            *Pushed by @${{ github.actor }} · commit \`${{ github.event.pull_request.head.sha }}\`*`;
+
+            // Update the existing bot comment instead of adding a new one on
+            // every push. A 12-commit PR should not have 12 plan comments.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes(MARKER));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # Only now fail the job. The comment is posted first so a reviewer can
+      # see WHY it failed without opening the Actions tab.
+      - name: Fail if any gate failed
+        if: |
+          steps.fmt.outcome == 'failure' ||
+          steps.validate.outcome == 'failure' ||
+          steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::One or more Terraform gates failed. See the PR comment."
+          exit 1

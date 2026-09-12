@@ -1,0 +1,10 @@
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+backend.hcl
+tfplan
+*.tfplan
+plan.txt
+.DS_Store
